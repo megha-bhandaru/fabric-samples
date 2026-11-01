@@ -1,166 +1,89 @@
-/*
- * Copyright IBM Corp. All Rights Reserved.
- *
- * SPDX-License-Identifier: Apache-2.0
- */
-
 'use strict';
 
-// Deterministic JSON.stringify()
-const stringify  = require('json-stringify-deterministic');
-const sortKeysRecursive  = require('sort-keys-recursive');
 const { Contract } = require('fabric-contract-api');
+
+const VERIFIER_MSP = 'Org1MSP';
 
 class AssetTransfer extends Contract {
 
-    async InitLedger(ctx) {
-        const assets = [
-            {
-                ID: 'asset1',
-                Color: 'blue',
-                Size: 5,
-                Owner: 'Tomoko',
-                AppraisedValue: 300,
-            },
-            {
-                ID: 'asset2',
-                Color: 'red',
-                Size: 5,
-                Owner: 'Brad',
-                AppraisedValue: 400,
-            },
-            {
-                ID: 'asset3',
-                Color: 'green',
-                Size: 10,
-                Owner: 'Jin Soo',
-                AppraisedValue: 500,
-            },
-            {
-                ID: 'asset4',
-                Color: 'yellow',
-                Size: 10,
-                Owner: 'Max',
-                AppraisedValue: 600,
-            },
-            {
-                ID: 'asset5',
-                Color: 'black',
-                Size: 15,
-                Owner: 'Adriana',
-                AppraisedValue: 700,
-            },
-            {
-                ID: 'asset6',
-                Color: 'white',
-                Size: 15,
-                Owner: 'Michel',
-                AppraisedValue: 800,
-            },
-        ];
-
-        for (const asset of assets) {
-            asset.docType = 'asset';
-            // example of how to write to world state deterministically
-            // use convetion of alphabetic order
-            // we insert data in alphabetic order using 'json-stringify-deterministic' and 'sort-keys-recursive'
-            // when retrieving data, in any lang, the order of data will be the same and consequently also the corresonding hash
-            await ctx.stub.putState(asset.ID, Buffer.from(stringify(sortKeysRecursive(asset))));
+    // Register a new identity. Only a hash of the documents is stored, never the real data.
+    async registerIdentity(ctx, userId, docHash) {
+        const existing = await ctx.stub.getState(userId);
+        if (existing && existing.length > 0) {
+            throw new Error(`Identity ${userId} already exists`);
         }
-    }
-
-    // CreateAsset issues a new asset to the world state with given details.
-    async CreateAsset(ctx, id, color, size, owner, appraisedValue) {
-        const exists = await this.AssetExists(ctx, id);
-        if (exists) {
-            throw new Error(`The asset ${id} already exists`);
-        }
-
-        const asset = {
-            ID: id,
-            Color: color,
-            Size: Number(size),
-            Owner: owner,
-            AppraisedValue: Number(appraisedValue),
+        const record = {
+            userId: userId,
+            docHash: docHash,
+            status: 'pending',
+            registeredBy: ctx.clientIdentity.getMSPID(),
+            verifiedBy: '',
+            consents: [],
         };
-        // we insert data in alphabetic order using 'json-stringify-deterministic' and 'sort-keys-recursive'
-        await ctx.stub.putState(id, Buffer.from(stringify(sortKeysRecursive(asset))));
-        return JSON.stringify(asset);
+        await ctx.stub.putState(userId, Buffer.from(JSON.stringify(record)));
+        return JSON.stringify(record);
     }
 
-    // ReadAsset returns the asset stored in the world state with given id.
-    async ReadAsset(ctx, id) {
-        const assetJSON = await ctx.stub.getState(id); // get the asset from chaincode state
-        if (!assetJSON || assetJSON.length === 0) {
-            throw new Error(`The asset ${id} does not exist`);
+    // Only the verifier org can mark an identity as verified.
+    async verifyIdentity(ctx, userId) {
+        const caller = ctx.clientIdentity.getMSPID();
+        if (caller !== VERIFIER_MSP) {
+            throw new Error(`${caller} is not allowed to verify identities`);
         }
-        return assetJSON.toString();
+        const record = await this._load(ctx, userId);
+        record.status = 'verified';
+        record.verifiedBy = caller;
+        await ctx.stub.putState(userId, Buffer.from(JSON.stringify(record)));
+        return JSON.stringify(record);
     }
 
-    // UpdateAsset updates an existing asset in the world state with provided parameters.
-    async UpdateAsset(ctx, id, color, size, owner, appraisedValue) {
-        const exists = await this.AssetExists(ctx, id);
-        if (!exists) {
-            throw new Error(`The asset ${id} does not exist`);
+    // The home institution gives another institution permission to check status.
+    async grantConsent(ctx, userId, institutionMsp) {
+        const record = await this._load(ctx, userId);
+        this._requireOwner(ctx, record);
+        if (!record.consents.includes(institutionMsp)) {
+            record.consents.push(institutionMsp);
         }
-
-        // overwriting original asset with new asset
-        const updatedAsset = {
-            ID: id,
-            Color: color,
-            Size: size,
-            Owner: owner,
-            AppraisedValue: appraisedValue,
-        };
-        // we insert data in alphabetic order using 'json-stringify-deterministic' and 'sort-keys-recursive'
-        return ctx.stub.putState(id, Buffer.from(stringify(sortKeysRecursive(updatedAsset))));
+        await ctx.stub.putState(userId, Buffer.from(JSON.stringify(record)));
+        return JSON.stringify(record);
     }
 
-    // DeleteAsset deletes an given asset from the world state.
-    async DeleteAsset(ctx, id) {
-        const exists = await this.AssetExists(ctx, id);
-        if (!exists) {
-            throw new Error(`The asset ${id} does not exist`);
+    // The home institution takes permission away again.
+    async revokeConsent(ctx, userId, institutionMsp) {
+        const record = await this._load(ctx, userId);
+        this._requireOwner(ctx, record);
+        record.consents = record.consents.filter((m) => m !== institutionMsp);
+        await ctx.stub.putState(userId, Buffer.from(JSON.stringify(record)));
+        return JSON.stringify(record);
+    }
+
+    // Returns the status only if the caller is the home institution, the verifier, or has consent.
+    async checkStatus(ctx, userId) {
+        const caller = ctx.clientIdentity.getMSPID();
+        const record = await this._load(ctx, userId);
+        const allowed = caller === record.registeredBy ||
+                        caller === VERIFIER_MSP ||
+                        record.consents.includes(caller);
+        if (!allowed) {
+            throw new Error(`${caller} has no consent to view ${userId}`);
         }
-        return ctx.stub.deleteState(id);
+        return JSON.stringify({ userId: record.userId, status: record.status });
     }
 
-    // AssetExists returns true when asset with given ID exists in world state.
-    async AssetExists(ctx, id) {
-        const assetJSON = await ctx.stub.getState(id);
-        return assetJSON && assetJSON.length > 0;
-    }
-
-    // TransferAsset updates the owner field of asset with given id in the world state.
-    async TransferAsset(ctx, id, newOwner) {
-        const assetString = await this.ReadAsset(ctx, id);
-        const asset = JSON.parse(assetString);
-        const oldOwner = asset.Owner;
-        asset.Owner = newOwner;
-        // we insert data in alphabetic order using 'json-stringify-deterministic' and 'sort-keys-recursive'
-        await ctx.stub.putState(id, Buffer.from(stringify(sortKeysRecursive(asset))));
-        return oldOwner;
-    }
-
-    // GetAllAssets returns all assets found in the world state.
-    async GetAllAssets(ctx) {
-        const allResults = [];
-        // range query with empty string for startKey and endKey does an open-ended query of all assets in the chaincode namespace.
-        const iterator = await ctx.stub.getStateByRange('', '');
-        let result = await iterator.next();
-        while (!result.done) {
-            const strValue = Buffer.from(result.value.value.toString()).toString('utf8');
-            let record;
-            try {
-                record = JSON.parse(strValue);
-            } catch (err) {
-                console.log(err);
-                record = strValue;
-            }
-            allResults.push(record);
-            result = await iterator.next();
+    // ---- helpers ----
+    async _load(ctx, userId) {
+        const data = await ctx.stub.getState(userId);
+        if (!data || data.length === 0) {
+            throw new Error(`Identity ${userId} does not exist`);
         }
-        return JSON.stringify(allResults);
+        return JSON.parse(data.toString());
+    }
+
+    _requireOwner(ctx, record) {
+        const caller = ctx.clientIdentity.getMSPID();
+        if (caller !== record.registeredBy) {
+            throw new Error(`Only ${record.registeredBy} can change consent for ${record.userId}`);
+        }
     }
 }
 
